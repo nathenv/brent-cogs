@@ -31,6 +31,8 @@ Notify groups of users, roles, or channels when certain phrases are said. The ba
 * `snitch on [group_name] [words...]` - Add trigger words to a notification group.
 * `snitch noton [group_name] [words...]` - Remove trigger words from the notification group. 
 * `snitch with [group_name] "[message]"` - Change the message sent with your snitch. Use double quotes around the message.
+* `snitch rate` - Show current rate limiting status and statistics.
+* `snitch setrate [number]` - Set the maximum messages per second for rate limiting (recommended: 30-35).
 
 ### `with` Tokens
 Put these strings in your message and they'll be replaced with appropriate values.
@@ -38,6 +40,14 @@ Put these strings in your message and they'll be replaced with appropriate value
 * `{{channel}} `- The channel name the message originated in.
 * `{{server}}` - The server name the message originated in.
 * `{{words}}` - The list of words that triggered the message.
+
+### Rate Limiting
+The snitch cog now includes intelligent rate limiting to prevent Discord rate limiting:
+- **Proactive Rate Limiting**: Automatically stays under Discord's rate limits with 2-3 message headroom
+- **Header Parsing**: Reads Discord's rate limit headers to understand current limits
+- **Configurable Limits**: Adjust the maximum messages per second (default: 35)
+- **Retry Logic**: Automatically retries failed messages after rate limit delays
+- **Status Monitoring**: Use `snitch rate` to monitor current rate limiting status
 
 ## Recorder
 Save all messages in the server to a log file. Broken up by channel and server name.

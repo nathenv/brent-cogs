@@ -2,10 +2,57 @@ import asyncio
 import discord
 import logging
 import re
+import time
 from datetime import timezone
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Tuple
 from redbot.core import checks, Config, commands
 from redbot.core.utils.chat_formatting import pagify
+
+
+class RateLimiter:
+    """Rate limiter that respects Discord's rate limit headers and maintains headroom."""
+
+    def __init__(self, max_messages_per_second: int = 35):  # Higher default for better throughput
+        self.max_messages_per_second = max_messages_per_second
+        self.message_timestamps = []
+        self.lock = asyncio.Lock()
+        self.last_rate_limit_reset = 0
+        self.remaining_requests = 50  # Default Discord limit
+        self.rate_limit_reset_time = 0
+
+    async def wait_if_needed(self):
+        """Wait if we're approaching rate limits."""
+        async with self.lock:
+            current_time = time.time()
+
+            # Clean old timestamps (older than 1 second)
+            self.message_timestamps = [ts for ts in self.message_timestamps
+                                     if current_time - ts < 1.0]
+
+            # Check if we're at the limit
+            if len(self.message_timestamps) >= self.max_messages_per_second:
+                # Wait until we can send another message
+                wait_time = 1.0 - (current_time - self.message_timestamps[0])
+                if wait_time > 0:
+                    logging.info(f"Rate limiting: waiting {wait_time:.2f} seconds")
+                    await asyncio.sleep(wait_time)
+                    current_time = time.time()
+
+            # Add current timestamp
+            self.message_timestamps.append(current_time)
+
+    def update_from_headers(self, headers: Dict[str, str]):
+        """Update rate limit info from Discord response headers."""
+        try:
+            if 'X-RateLimit-Remaining' in headers:
+                self.remaining_requests = int(headers['X-RateLimit-Remaining'])
+
+            if 'X-RateLimit-Reset' in headers:
+                self.rate_limit_reset_time = float(headers['X-RateLimit-Reset'])
+
+            logging.debug(f"Rate limit headers: remaining={self.remaining_requests}, reset={self.rate_limit_reset_time}")
+        except (ValueError, KeyError) as e:
+            logging.warning(f"Failed to parse rate limit headers: {e}")
 
 
 class Snitch(commands.Cog):
@@ -20,6 +67,7 @@ class Snitch(commands.Cog):
         self.config = Config.get_conf(self, identifier=586925412)
         default_guild_settings = {"notifygroups": {}}
         self.config.register_guild(**default_guild_settings)
+        self.rate_limiter = RateLimiter()
 
     @commands.group("snitch")
     @commands.guild_only()
@@ -277,6 +325,66 @@ class Snitch(commands.Cog):
             )
             await ctx.send("I can't send direct messages to you.")
 
+    @_snitch.command(name="rate")
+    async def _rate_limit_status(self, ctx: commands.Context):
+        """Show current rate limiting status and statistics.
+
+        Example:
+            [p]snitch rate
+
+        :param ctx: The Discord Red command context.
+        :type ctx: commands.Context
+        """
+        current_time = time.time()
+        recent_messages = len([ts for ts in self.rate_limiter.message_timestamps 
+                             if current_time - ts < 1.0])
+        
+        embed = discord.Embed(
+            title="Snitch Rate Limiting Status",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Current Rate", 
+            value=f"{recent_messages}/{self.rate_limiter.max_messages_per_second} messages per second",
+            inline=True
+        )
+        embed.add_field(
+            name="Remaining Requests", 
+            value=f"{self.rate_limiter.remaining_requests}",
+            inline=True
+        )
+        embed.add_field(
+            name="Rate Limit Reset", 
+            value=f"<t:{int(self.rate_limiter.rate_limit_reset_time)}:R>" if self.rate_limiter.rate_limit_reset_time > 0 else "Unknown",
+            inline=True
+        )
+        embed.add_field(
+            name="Headroom", 
+            value=f"{self.rate_limiter.max_messages_per_second - recent_messages} messages available",
+            inline=True
+        )
+        
+        await ctx.send(embed=embed)
+
+    @_snitch.command(name="setrate")
+    async def _set_rate_limit(self, ctx: commands.Context, max_messages_per_second: int):
+        """Set the maximum messages per second for rate limiting.
+
+        Example:
+            [p]snitch setrate 15
+
+        :param ctx: The Discord Red command context.
+        :type ctx: commands.Context
+        :param max_messages_per_second: Maximum messages per second (recommended: 30-35)
+        :type max_messages_per_second: int
+        """
+        if max_messages_per_second < 1 or max_messages_per_second > 50:
+            await ctx.send("Rate limit must be between 1 and 50 messages per second.")
+            return
+            
+        self.rate_limiter.max_messages_per_second = max_messages_per_second
+        await ctx.send(f"Rate limit set to {max_messages_per_second} messages per second.")
+
     async def _send_to_member(
         self,
         member: discord.Member,
@@ -298,8 +406,32 @@ class Snitch(commands.Cog):
         try:
             if member.bot:
                 return
-            await member.send(content=message, embed=embed)
+                
+            # Wait for rate limiter before sending
+            await self.rate_limiter.wait_if_needed()
+            
+            # Send the message and capture response for headers
+            response = await member.send(content=message, embed=embed)
+            
+            # Update rate limiter with headers if available
+            if hasattr(response, '_response') and hasattr(response._response, 'headers'):
+                self.rate_limiter.update_from_headers(dict(response._response.headers))
+            
             logging.info(f"Sent {message} to {member.display_name}.")
+        except discord.RateLimited as e:
+            logging.error(
+                f'RATE LIMITED {e}\n  Hit rate limit while sending to {member.display_name}. Waiting {e.retry_after} seconds.'
+            )
+            await asyncio.sleep(e.retry_after)
+            # Retry once after waiting
+            try:
+                await self.rate_limiter.wait_if_needed()
+                await member.send(content=message, embed=embed)
+                logging.info(f"Retry successful: sent {message} to {member.display_name}.")
+            except Exception as retry_e:
+                logging.error(
+                    f'RETRY FAILED {retry_e}\n  Failed retry sending "{message}" to {member.display_name}.'
+                )
         except Exception as e:
             logging.error(
                 f'EXCEPTION {e}\n  Failed in sending "{message}" to {member.display_name}.'
@@ -339,50 +471,81 @@ class Snitch(commands.Cog):
             url=message.jump_url,
             colour=discord.Color.red(),
         ).set_thumbnail(url=message.author.display_avatar.url)
+        
         # Loop over all the targets identified in the config and send them a message.
-        # Cap at 20 simultaneous requests.
+        # Use rate limiter to stay under Discord's limits with headroom.
         waitlist = []
-        sem = asyncio.Semaphore(20)
+        sem = asyncio.Semaphore(10)  # Reduced from 20 to be more conservative
+        
+        async def send_to_target(target):
+            """Send notification to a single target with proper rate limiting."""
+            async with sem:
+                try:
+                    target_id = target["id"]
+                    target_type = target["type"]
+                    
+                    if target_type == "TextChannel":
+                        chan = message.guild.get_channel(target_id)
+                        if chan:
+                            # Wait for rate limiter before sending
+                            await self.rate_limiter.wait_if_needed()
+                            
+                            # Send message and capture response for headers
+                            response = await chan.send(f"@everyone {base_msg}", embed=embed)
+                            
+                            # Update rate limiter with headers if available
+                            if hasattr(response, '_response') and hasattr(response._response, 'headers'):
+                                self.rate_limiter.update_from_headers(dict(response._response.headers))
+                            
+                            logging.info(f"Sent notification to channel {chan.name}.")
+                            
+                    elif target_type == "Member":
+                        member = message.guild.get_member(target_id)
+                        if member:
+                            await self._send_to_member(member, base_msg, embed)
+                            
+                    elif target_type == "Role":
+                        role = message.guild.get_role(target_id)
+                        if role:
+                            for member in role.members:
+                                await self._send_to_member(member, base_msg, embed)
+                                
+                except discord.RateLimited as e:
+                    logging.error(
+                        f"RATE LIMITED {e}\n  Hit rate limit while sending to {target_type} {target_id}. Waiting {e.retry_after} seconds."
+                    )
+                    await asyncio.sleep(e.retry_after)
+                    # Retry once after waiting
+                    try:
+                        await self.rate_limiter.wait_if_needed()
+                        if target_type == "TextChannel":
+                            chan = message.guild.get_channel(target_id)
+                            if chan:
+                                await chan.send(f"@everyone {base_msg}", embed=embed)
+                        elif target_type == "Member":
+                            member = message.guild.get_member(target_id)
+                            if member:
+                                await member.send(content=base_msg, embed=embed)
+                        elif target_type == "Role":
+                            role = message.guild.get_role(target_id)
+                            if role:
+                                for member in role.members:
+                                    await member.send(content=base_msg, embed=embed)
+                        logging.info(f"Retry successful for {target_type} {target_id}.")
+                    except Exception as retry_e:
+                        logging.error(
+                            f"RETRY FAILED {retry_e}\n  Failed retry for {target_type} {target_id}."
+                        )
+                except Exception as e:
+                    logging.error(
+                        f"EXCEPTION {e}\n  Trying to message {target}\n  Triggered on {message.clean_content} by {message.author}"
+                    )
+        
+        # Create tasks for all targets
         for target in targets:
-            await sem.acquire()
-            try:
-                target_id = target["id"]
-                target_type = target["type"]
-                if target_type == "TextChannel":
-                    chan = message.guild.get_channel(target_id)
-                    waitlist.append(
-                        asyncio.create_task(
-                            chan.send(f"@everyone {base_msg}", embed=embed)
-                        )
-                    )
-                    logging.info(f"Sent {message} to {chan.name}.")
-                elif target_type == "Member":
-                    member = message.guild.get_member(target_id)
-                    waitlist.append(
-                        asyncio.create_task(
-                            self._send_to_member(member, base_msg, embed)
-                        )
-                    )
-                elif target_type == "Role":
-                    role = message.guild.get_role(target_id)
-                    for member in role.members:
-                        waitlist.append(
-                            asyncio.create_task(
-                                self._send_to_member(member, base_msg, embed)
-                            )
-                        )
-            except discord.RateLimited as e:
-                logging.error(
-                    f"EXCEPTION {e}\n  Hit excessive rate limit. Waiting {e.retry_after} seconds to try again."
-                )
-                await asyncio.sleep(e.retry_after)
-            except Exception as e:
-                logging.error(
-                    f"EXCEPTION {e}\n  Trying to message {target}\n  Triggered on {message.clean_content} by {message.author}"
-                )
-            finally:
-                sem.release()
-        # We only await at the end since an @everyone in a big server takes freaking forever otherwise.
+            waitlist.append(asyncio.create_task(send_to_target(target)))
+        
+        # Wait for all tasks to complete
         if waitlist:
             await asyncio.wait(waitlist, return_when=asyncio.ALL_COMPLETED)
 
