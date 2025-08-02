@@ -94,7 +94,7 @@ class RateLimiter:
             try:
                 result = await self.send_message(send_func, *args, **kwargs)
                 results.append(result)
-                logging.debug(f"Successfully sent message {i+1}/{len(messages_to_send)}")
+                logging.info(f"Successfully sent message {i+1}/{len(messages_to_send)}")
                 
             except Exception as e:
                 logging.error(f"Failed to send message {i+1}: {e}")
@@ -111,9 +111,9 @@ class RateLimiter:
             if 'X-RateLimit-Reset' in headers:
                 self.rate_limit_reset_time = float(headers['X-RateLimit-Reset'])
 
-            logging.debug(f"Rate limit headers: remaining={self.remaining_requests}, reset={self.rate_limit_reset_time}")
+            logging.info(f"Rate limit headers: remaining={self.remaining_requests}, reset={self.rate_limit_reset_time}")
         except (ValueError, KeyError) as e:
-            logging.warning(f"Failed to parse rate limit headers: {e}")
+            logging.info(f"Failed to parse rate limit headers: {e}")
 
 
 class Snitch(commands.Cog):
