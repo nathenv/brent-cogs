@@ -374,6 +374,21 @@ class Snitch(commands.Cog):
         self.rate_limiter.max_requests_per_second = max_requests_per_second
         await ctx.send(f"Rate limit set to {max_requests_per_second} requests per second.")
 
+    @_snitch.command(name="setconcurrency")
+    async def _set_concurrency(self, ctx: commands.Context, max_concurrent: int):
+        """Set the maximum concurrent operations for rate limiting.
+        
+        Recommended: 10-30 depending on server size and Discord API tolerance.
+        """
+        if max_concurrent < 1 or max_concurrent > 50:
+            await ctx.send("Concurrency limit must be between 1 and 50 operations.")
+            return
+            
+        # Update the semaphore with new limit
+        self.rate_limiter.max_concurrent = max_concurrent
+        self.rate_limiter.semaphore = asyncio.Semaphore(max_concurrent)
+        await ctx.send(f"Concurrency limit set to {max_concurrent} simultaneous operations.")
+
     async def _send_to_member(
         self,
         member: discord.Member,
