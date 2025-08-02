@@ -3,8 +3,7 @@ import discord
 import logging
 import re
 import time
-from datetime import timezone
-from typing import Optional, Union, Dict, Tuple
+from typing import Optional, Union, Dict
 from redbot.core import checks, Config, commands
 from redbot.core.utils.chat_formatting import pagify
 
@@ -475,7 +474,7 @@ class Snitch(commands.Cog):
         # Loop over all the targets identified in the config and send them a message.
         # Use rate limiter to stay under Discord's limits with headroom.
         waitlist = []
-        sem = asyncio.Semaphore(10)  # Reduced from 20 to be more conservative
+        sem = asyncio.Semaphore(25)  # Increased for better throughput
         
         async def send_to_target(target):
             """Send notification to a single target with proper rate limiting."""
@@ -507,8 +506,14 @@ class Snitch(commands.Cog):
                     elif target_type == "Role":
                         role = message.guild.get_role(target_id)
                         if role:
+                            # Process role members concurrently for better performance
+                            member_tasks = []
                             for member in role.members:
-                                await self._send_to_member(member, base_msg, embed)
+                                if not member.bot:  # Skip bots
+                                    member_tasks.append(self._send_to_member(member, base_msg, embed))
+                            
+                            if member_tasks:
+                                await asyncio.gather(*member_tasks, return_exceptions=True)
                                 
                 except discord.RateLimited as e:
                     logging.error(
@@ -529,8 +534,13 @@ class Snitch(commands.Cog):
                         elif target_type == "Role":
                             role = message.guild.get_role(target_id)
                             if role:
+                                # Retry role members concurrently
+                                member_tasks = []
                                 for member in role.members:
-                                    await member.send(content=base_msg, embed=embed)
+                                    if not member.bot:
+                                        member_tasks.append(member.send(content=base_msg, embed=embed))
+                                if member_tasks:
+                                    await asyncio.gather(*member_tasks, return_exceptions=True)
                         logging.info(f"Retry successful for {target_type} {target_id}.")
                     except Exception as retry_e:
                         logging.error(
